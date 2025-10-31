@@ -1,1000 +1,1036 @@
-#!/usr/bin/env php
+#!/usr/bin/php
 <?php
 
-/**
- * TCP/UDP Connection Monitor - PHP Version
- * Parses /proc/net/{tcp,udp,tcp6,udp6} to show active IPv4/IPv6 TCP/UDP connections
- * Maintains all features: IPv6 conversion, CIDR matching, UDP support, CSV/JSON outputs, alerts, config file
- */
+defined('AF_INET')  || define('AF_INET', 2);
+defined('AF_INET6') || define('AF_INET6', 10);
+defined('JSON_INVALID_UTF8_SUBSTITUTE') || define('JSON_INVALID_UTF8_SUBSTITUTE', 0);
 
-declare(strict_types=1);
+const TCP_STATES = [
+    '01' => "ESTABLISHED",
+    '02' => "SYN_SENT",
+    '03' => "SYN_RECV",
+    '04' => "FIN_WAIT1",
+    '05' => "FIN_WAIT2",
+    '06' => "TIME_WAIT",
+    '07' => "CLOSE",
+    '08' => "CLOSE_WAIT",
+    '09' => "LAST_ACK",
+    '0A' => "LISTEN",
+    '0B' => "CLOSING",
+    '0C' => "NEW_SYN_RECV",
+];
 
-class ConnectionMonitor {
-    // Color codes for output
-    private const RED = "\033[31m";
-    private const GREEN = "\033[32m";
-    private const YELLOW = "\033[33m";
-    private const BLUE = "\033[34m";
-    private const MAGENTA = "\033[35m";
-    private const CYAN = "\033[36m";
-    private const WHITE = "\033[37m";
-    private const BOLD = "\033[1m";
-    private const RESET = "\033[0m";
+const COLORS = [
+    'LISTEN' => "\033[32m",
+    'ESTABLISHED' => "\033[36m",
+    'TIME_WAIT' => "\033[33m",
+    'CLOSE_WAIT' => "\033[31m",
+    'FIN_WAIT1' => "\033[35m",
+    'FIN_WAIT2' => "\033[35m",
+    'reset' => "\033[0m"
+];
 
-    // TCP state mappings
-    private const TCP_STATES = [
-        '01' => 'ESTABLISHED',
-        '02' => 'SYN_SENT',
-        '03' => 'SYN_RECV',
-        '04' => 'FIN_WAIT1',
-        '05' => 'FIN_WAIT2',
-        '06' => 'TIME_WAIT',
-        '07' => 'CLOSE',
-        '08' => 'CLOSE_WAIT',
-        '09' => 'LAST_ACK',
-        '0A' => 'LISTEN',
-        '0B' => 'CLOSING',
-        '0C' => 'NEW_SYN_RECV',
+class Security {
+    public static function sanitizeOutput($data) {
+        if (!is_string($data)) return $data;
+        return htmlspecialchars($data, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+    
+    public static function validatePath($path) {
+        $realpath = realpath($path);
+        return $realpath && strpos($realpath, '/proc/') === 0;
+    }
+}
+
+class Config {
+    private static $defaults = [
+        'refresh_interval' => 2,
+        'max_display_processes' => 10,
+        'process_cache_ttl' => 5,
+        'connection_cache_ttl' => 1,
+        'colors_enabled' => true,
+        'max_history' => 1000,
+        'rate_limit_requests' => 100,
+        'rate_limit_window' => 60,
     ];
+    
+    public static function get(string $key, $default = null) {
+        return $_ENV['TCP_MONITOR_' . strtoupper($key)] ?? self::$defaults[$key] ?? $default;
+    }
+    
+    public static function set(string $key, $value): void {
+        self::$defaults[$key] = $value;
+    }
+}
 
-    // UDP states
-    private const UDP_STATES = [
-        '0A' => 'LISTEN',
-        '07' => 'UNCONNECTED',
-    ];
+class RateLimiter {
+    private static $requests = [];
+    
+    public static function checkLimit(): bool {
+        $maxRequests = Config::get('rate_limit_requests', 100);
+        $window = Config::get('rate_limit_window', 60);
+        $now = time();
+        
+        self::$requests = array_filter(self::$requests, function($time) use ($now, $window) {
+            return $time > $now - $window;
+        });
+        
+        if (count(self::$requests) >= $maxRequests) {
+            return false;
+        }
+        
+        self::$requests[] = $now;
+        return true;
+    }
+}
 
-    // State colors
-    private const STATE_COLORS = [
-        'LISTEN' => self::GREEN,
-        'ESTABLISHED' => self::CYAN,
-        'TIME_WAIT' => self::YELLOW,
-        'CLOSE_WAIT' => self::RED,
-        'FIN_WAIT1' => self::MAGENTA,
-        'FIN_WAIT2' => self::MAGENTA,
-        'SYN_SENT' => self::BLUE,
-        'SYN_RECV' => self::BLUE,
-        'UNCONNECTED' => self::WHITE,
-        'UNKNOWN' => self::RED,
-    ];
+class PerformanceTracker {
+    private static $startTime;
+    private static $memoryPeak = 0;
+    private static $operations = 0;
 
-    // Configuration defaults
-    private array $config;
-    private array $processCache = [];
-    private array $connectionCache = [];
-    private float $lastProcessScan = 0;
-    private float $lastConnectionScan = 0;
-    private float $scriptStartTime;
-    private int $operationCount = 0;
-    private const SCRIPT_VERSION = '2.0-php';
-
-    public function __construct() {
-        $this->scriptStartTime = microtime(true);
-        $this->initializeConfig();
-        $this->loadConfig();
+    public static function start(): void {
+        self::$startTime = microtime(true);
+        self::$memoryPeak = memory_get_peak_usage(true);
     }
 
-    private function initializeConfig(): void {
-        $this->config = [
-            'refresh_interval' => 2,
-            'process_cache_ttl' => 5,
-            'max_display_processes' => 10,
-            'connection_cache_ttl' => 1,
-            'show_udp' => false,
-            'csv_output' => false,
-            'alert_state' => '',
-            'alert_threshold' => 0,
-            'json_output' => false,
-            'show_processes' => false,
-            'show_count' => false,
-            'show_stats' => false,
-            'watch_mode' => false,
-            'verbose' => false,
-            'alert_mode' => false,
-            'filter_states' => [],
-            'filter_port' => '',
-            'filter_local_ip' => '',
-            'filter_remote_ip' => '',
-            'filter_ipv4' => false,
-            'filter_ipv6' => false,
-            'output_file' => '',
-            'include_una' => true,
-            'sender_id' => 'SENDER',
-            'receiver_id' => 'RECEIVER',
-            'max_segment_length' => 2000,
-        ];
-    }
-
-    private function loadConfig(): void {
-        $configFile = getenv('HOME') . '/.tcpmonrc';
-        if (is_readable($configFile)) {
-            $lines = file($configFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            foreach ($lines as $line) {
-                if (strpos($line, '=') !== false) {
-                    [$key, $value] = explode('=', $line, 2);
-                    $key = trim($key);
-                    $value = trim($value);
-                    
-                    switch ($key) {
-                        case 'REFRESH_INTERVAL':
-                        case 'PROCESS_CACHE_TTL':
-                        case 'MAX_DISPLAY_PROCESSES':
-                        case 'CONNECTION_CACHE_TTL':
-                        case 'ALERT_THRESHOLD':
-                            if (ctype_digit($value)) {
-                                $this->config[strtolower($key)] = (int)$value;
-                            }
-                            break;
-                        case 'SHOW_UDP':
-                            $this->config['show_udp'] = ($value === 'true');
-                            break;
-                        case 'ALERT_STATE':
-                            $this->config['alert_state'] = $value;
-                            break;
-                    }
-                }
-            }
-            $this->info("Loaded config from $configFile");
+    public static function recordOperation(): void {
+        self::$operations++;
+        $currentMemory = memory_get_peak_usage(true);
+        if ($currentMemory > self::$memoryPeak) {
+            self::$memoryPeak = $currentMemory;
         }
     }
 
-    private function die(string $message): void {
-        echo self::RED . "Error: " . self::RESET . $message . PHP_EOL;
-        exit(1);
-    }
-
-    private function warn(string $message): void {
-        echo self::YELLOW . "Warning: " . self::RESET . $message . PHP_EOL;
-    }
-
-    private function info(string $message): void {
-        if ($this->config['verbose']) {
-            echo self::BLUE . "Info: " . self::RESET . $message . PHP_EOL;
-        }
-    }
-
-    private function recordOperation(): void {
-        $this->operationCount++;
-    }
-
-    private function getPerformanceMetrics(): string {
+    public static function getMetrics(): array {
         $endTime = microtime(true);
-        $executionTime = $endTime - $this->scriptStartTime;
-        
-        $memoryPeak = memory_get_peak_usage(true);
-        $memoryPeakMB = round($memoryPeak / 1024 / 1024, 2);
-        
-        return sprintf(
-            "Execution time: %.3fs\nMemory peak: %.2f MB\nOperations: %d\n",
-            $executionTime,
-            $memoryPeakMB,
-            $this->operationCount
-        );
-    }
-
-    private function validatePort(int $port): void {
-        if ($port < 1 || $port > 65535) {
-            $this->die("Port must be between 1 and 65535");
-        }
-    }
-
-    private function validateInterval(int $interval): void {
-        if ($interval < 1 || $interval > 3600) {
-            $this->die("Interval must be between 1 and 3600 seconds");
-        }
-    }
-
-    private function validateThreshold(int $threshold): void {
-        if ($threshold < 0) {
-            $this->die("Threshold must be a non-negative integer");
-        }
-    }
-
-    private function validateIpCidr(string $ipCidr): void {
-        if (strpos($ipCidr, '/') !== false) {
-            [$ip, $mask] = explode('/', $ipCidr, 2);
-            if (!ctype_digit($mask) || $mask < 0) {
-                $this->die("Invalid CIDR mask: $mask");
-            }
-            
-            // Validate IP format
-            if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
-                $this->die("Invalid IP address in CIDR: $ip");
-            }
-            
-            $maxMask = (strpos($ip, ':') !== false) ? 128 : 32;
-            if ($mask > $maxMask) {
-                $this->die("CIDR mask $mask exceeds maximum for IP type ($maxMask)");
-            }
-        } elseif (filter_var($ipCidr, FILTER_VALIDATE_IP) === false) {
-            $this->die("Invalid IP or CIDR format: $ipCidr");
-        }
-    }
-
-    private function ip4ToInt(string $ip): int {
-        $octets = explode('.', $ip);
-        return ($octets[0] << 24) + ($octets[1] << 16) + ($octets[2] << 8) + $octets[3];
-    }
-
-    private function cidr4Match(string $ip, string $network, int $mask): bool {
-        $ipInt = $this->ip4ToInt($ip);
-        $netInt = $this->ip4ToInt($network);
-        $maskInt = (0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF;
-        return ($ipInt & $maskInt) === ($netInt & $maskInt);
-    }
-
-    private function cidr6Match(string $ip, string $network, int $mask): bool {
-        $prefixLen = (int)($mask / 4);
-        $ipPrefix = substr($ip, 0, $prefixLen);
-        $netPrefix = substr($network, 0, $prefixLen);
-        return $ipPrefix === $netPrefix;
-    }
-
-    private function ipMatchesFilter(string $ip, string $filter, string $family): bool {
-        if ($ip === $filter) {
-            return true;
-        }
-
-        if (strpos($filter, '/') !== false) {
-            [$network, $mask] = explode('/', $filter, 2);
-            $mask = (int)$mask;
-            
-            if ($family === 'ipv4') {
-                return $this->cidr4Match($ip, $network, $mask);
-            } else {
-                return $this->cidr6Match($ip, $network, $mask);
-            }
-        }
-
-        return strpos($ip, $filter) !== false;
-    }
-
-    private function checkRequirements(): void {
-        if (PHP_OS_FAMILY !== 'Linux') {
-            $this->die("This script only works on Linux systems");
-        }
-
-        if (!is_dir('/proc')) {
-            $this->die("/proc filesystem not available");
-        }
-
-        if ($this->config['show_processes'] && posix_geteuid() !== 0) {
-            $this->warn("Some process information may be limited without root privileges");
-        }
-    }
-
-    public function showHelp(): void {
-        $scriptName = $this->getScriptName();
-        $helpText = self::BOLD . "TCP/UDP Connection Monitor v" . self::SCRIPT_VERSION . self::RESET . "\n\n" .
-                   self::BOLD . "Usage:" . self::RESET . " $scriptName [options]\n\n" .
-                   self::BOLD . "Options:" . self::RESET . "\n" .
-                   "  " . self::BOLD . "--json" . self::RESET . "              Output connections in JSON format\n" .
-                   "  " . self::BOLD . "--csv" . self::RESET . "               Output connections in CSV format\n" .
-                   "  " . self::BOLD . "--udp" . self::RESET . "               Include UDP connections\n" .
-                   "  " . self::BOLD . "--listen" . self::RESET . "            Show only listening sockets\n" .
-                   "  " . self::BOLD . "--established" . self::RESET . "       Show only established connections\n" .
-                   "  " . self::BOLD . "--timewait" . self::RESET . "          Show only TIME_WAIT connections\n" .
-                   "  " . self::BOLD . "--closewait" . self::RESET . "         Show only CLOSE_WAIT connections\n" .
-                   "  " . self::BOLD . "--finwait" . self::RESET . "           Show only FIN_WAIT1/FIN_WAIT2 connections\n" .
-                   "  " . self::BOLD . "--count" . self::RESET . "             Only show counts (IPv4/IPv6/total/TCP/UDP)\n" .
-                   "  " . self::BOLD . "--processes" . self::RESET . "         Show process information (slower)\n" .
-                   "  " . self::BOLD . "--port NUM" . self::RESET . "          Filter by port number\n" .
-                   "  " . self::BOLD . "--local-ip IP" . self::RESET . "       Filter by local IP address (supports CIDR)\n" .
-                   "  " . self::BOLD . "--remote-ip IP" . self::RESET . "      Filter by remote IP address (supports CIDR)\n" .
-                   "  " . self::BOLD . "--ipv4" . self::RESET . "              Show only IPv4 connections\n" .
-                   "  " . self::BOLD . "--ipv6" . self::RESET . "              Show only IPv6 connections\n" .
-                   "  " . self::BOLD . "--watch [SEC]" . self::RESET . "       Refresh continuously (default: 2s)\n" .
-                   "  " . self::BOLD . "--stats" . self::RESET . "             Show detailed statistics\n" .
-                   "  " . self::BOLD . "--alert-state STATE" . self::RESET . " Enable alerts for state (e.g., CLOSE_WAIT)\n" .
-                   "  " . self::BOLD . "--alert-threshold N" . self::RESET . " Alert if count > N (default: 0)\n" .
-                   "  " . self::BOLD . "--output FILE" . self::RESET . "       Write output to file\n" .
-                   "  " . self::BOLD . "--verbose, -v" . self::RESET . "       Show performance metrics and debug info\n" .
-                   "  " . self::BOLD . "--version" . self::RESET . "           Show version\n" .
-                   "  " . self::BOLD . "--help" . self::RESET . "              Show this help message\n\n" .
-                   self::BOLD . "Config:" . self::RESET . " Edit ~/.tcpmonrc for defaults (e.g., REFRESH_INTERVAL=5)\n\n" .
-                   self::BOLD . "Examples:" . self::RESET . "\n" .
-                   "  $scriptName --listen --processes --udp\n" .
-                   "  $scriptName --established --json\n" .
-                   "  $scriptName --port 80 --ipv4\n" .
-                   "  $scriptName --watch 5 --stats\n" .
-                   "  $scriptName --local-ip \"192.168.1.0/24\" --alert-state CLOSE_WAIT --alert-threshold 50\n" .
-                   "  $scriptName --csv --output connections.csv\n\n" .
-                   self::BOLD . "Note:" . self::RESET . " Requires Linux and access to /proc filesystem\n";
-        
-        echo $helpText;
-    }
-
-    private function getScriptName(): string {
-        return basename($_SERVER['argv'][0]);
-    }
-
-    public function showVersion(): void {
-        echo "TCP/UDP Connection Monitor v" . self::SCRIPT_VERSION . PHP_EOL;
-        exit(0);
-    }
-
-    private function hexToDec(string $hex): int {
-        return intval($hex, 16);
-    }
-
-    private function hexToIpv4(string $hex): string {
-        $hex = str_pad($hex, 8, '0', STR_PAD_LEFT);
-        $octets = [
-            $this->hexToDec(substr($hex, 0, 2)),
-            $this->hexToDec(substr($hex, 2, 2)),
-            $this->hexToDec(substr($hex, 4, 2)),
-            $this->hexToDec(substr($hex, 6, 2))
+        return [
+            'execution_time' => round($endTime - self::$startTime, 4),
+            'memory_peak_mb' => round(self::$memoryPeak / 1024 / 1024, 2),
+            'operations' => self::$operations,
+            'timestamp' => date('c')
         ];
-        return implode('.', $octets);
     }
+}
 
-    private function hexToIpv6(string $hex): string {
-        $hex = str_pad($hex, 32, '0', STR_PAD_LEFT);
-        $hextets = [];
-        
-        for ($i = 0; $i < 32; $i += 4) {
-            $hextet = substr($hex, $i, 4);
-            $hextets[] = dechex(hexdec($hextet));
+class ErrorHandler {
+    public static function handleFileRead(string $file): string {
+        if (!Security::validatePath($file)) {
+            throw new RuntimeException("Invalid file path: $file");
         }
         
-        // Compress longest run of zeros
-        $longestStart = 0;
-        $longestLength = 0;
-        $currentStart = 0;
-        $currentLength = 0;
-        
-        foreach ($hextets as $i => $hextet) {
-            if ($hextet === '0') {
-                if ($currentLength === 0) {
-                    $currentStart = $i;
-                }
-                $currentLength++;
-            } else {
-                if ($currentLength > $longestLength) {
-                    $longestStart = $currentStart;
-                    $longestLength = $currentLength;
-                }
-                $currentLength = 0;
-            }
+        if (!file_exists($file)) {
+            throw new RuntimeException("File $file does not exist");
         }
         
-        if ($currentLength > $longestLength) {
-            $longestStart = $currentStart;
-            $longestLength = $currentLength;
-        }
-        
-        if ($longestLength > 1) {
-            $before = array_slice($hextets, 0, $longestStart);
-            $after = array_slice($hextets, $longestStart + $longestLength);
-            
-            if (empty($before) && empty($after)) {
-                return '::';
-            } elseif (empty($before)) {
-                return '::' . implode(':', $after);
-            } elseif (empty($after)) {
-                return implode(':', $before) . '::';
-            } else {
-                return implode(':', $before) . '::' . implode(':', $after);
-            }
-        }
-        
-        return implode(':', $hextets);
-    }
-
-    private function buildProcessMap(): void {
-        $this->info("Building process map...");
-        $this->processCache = [];
-        $currentTime = time();
-        
-        $inodes = [];
-        $protoFiles = ['/proc/net/tcp', '/proc/net/tcp6', '/proc/net/udp', '/proc/net/udp6'];
-        
-        foreach ($protoFiles as $file) {
-            if (!is_readable($file)) continue;
-            
-            $content = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            array_shift($content); // Skip header
-            
-            foreach ($content as $line) {
-                if (preg_match('/\s+\d+:\s+[0-9A-F:]+\s+[0-9A-F:]+\s+[0-9A-F]+\s+[0-9A-F]+\s+[0-9A-F]+\s+[0-9A-F]+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\d+)/', $line, $matches)) {
-                    $inodes[] = $matches[1];
-                }
-            }
-        }
-        
-        $inodes = array_unique($inodes);
-        
-        foreach (glob('/proc/[0-9]*') as $pidDir) {
-            $pid = basename($pidDir);
-            $fdDir = "$pidDir/fd";
-            
-            if (!is_dir($fdDir) || !is_readable($fdDir)) continue;
-            
-            $processName = 'unknown';
-            $commFile = "$pidDir/comm";
-            if (is_readable($commFile)) {
-                $processName = trim(file_get_contents($commFile)) . " (PID: $pid)";
-            } else {
-                $processName = "PID: $pid";
-            }
-            
-            foreach (glob("$fdDir/*") as $fd) {
-                $link = @readlink($fd);
-                if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
-                    $inode = $matches[1];
-                    if (in_array($inode, $inodes)) {
-                        $this->processCache[$inode] = $processName;
-                    }
-                }
-            }
-        }
-        
-        $this->lastProcessScan = $currentTime;
-        $this->info("Process map built with " . count($this->processCache) . " entries");
-    }
-
-    private function getProcessByInode(string $inode): string {
-        $currentTime = time();
-        
-        if (($currentTime - $this->lastProcessScan) >= $this->config['process_cache_ttl'] || empty($this->processCache)) {
-            $this->buildProcessMap();
-        }
-        
-        return $this->processCache[$inode] ?? 'unknown';
-    }
-
-    private function parseProtoFile(string $file, string $family, string $proto): array {
         if (!is_readable($file)) {
-            $this->warn("Cannot read file: $file");
-            return [];
+            throw new RuntimeException("File $file is not readable");
         }
         
-        $cacheKey = "{$file}_{$family}_{$proto}";
-        $fileMtime = filemtime($file);
-        $currentTime = time();
-        
-        if (($currentTime - $this->lastConnectionScan) < $this->config['connection_cache_ttl'] &&
-            isset($this->connectionCache[$cacheKey]) &&
-            $this->connectionCache[$cacheKey . '_mtime'] === $fileMtime) {
-            $this->info("Using cached connections from $file ($proto)");
-            return $this->connectionCache[$cacheKey];
+        $content = @file_get_contents($file);
+        if ($content === false) {
+            throw new RuntimeException("Failed to read $file");
         }
         
-        $this->info("Parsing $file ($proto)");
-        $connections = [];
-        $content = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        array_shift($content); // Skip header
+        return $content;
+    }
+    
+    public static function handle(Exception $e, bool $verbose = false): void {
+        fwrite(STDERR, "Error: " . Security::sanitizeOutput($e->getMessage()) . "\n");
+        if ($verbose) {
+            fwrite(STDERR, "File: " . Security::sanitizeOutput($e->getFile()) . " Line: " . Security::sanitizeOutput($e->getLine()) . "\n");
+        }
+    }
+}
+
+class InputValidator {
+    public static function validatePort($port): int {
+        if (!is_numeric($port) || $port < 1 || $port > 65535) {
+            throw new InvalidArgumentException("Port must be between 1 and 65535");
+        }
+        return (int)$port;
+    }
+    
+    public static function validateIpFilter(string $filter): string {
+        if (!self::isValidIpOrCidr($filter)) {
+            throw new InvalidArgumentException("Invalid IP or CIDR notation: $filter");
+        }
+        return $filter;
+    }
+    
+    private static function isValidIpOrCidr(string $input): bool {
+        if (strpos($input, '/') !== false) {
+            list($ip, $mask) = explode('/', $input, 2);
+            if (!is_numeric($mask) || $mask < 0 || $mask > 128) {
+                return false;
+            }
+            return filter_var($ip, FILTER_VALIDATE_IP) !== false;
+        }
         
-        foreach ($content as $line) {
-            $this->recordOperation();
-            
-            $fields = preg_split('/\s+/', trim($line));
-            if (count($fields) < 10) continue;
-            
-            $localAddr = $fields[1] ?? '';
-            $remoteAddr = $fields[2] ?? '';
-            $stateHex = $fields[3] ?? '';
-            $inode = $fields[9] ?? '';
-            
-            if (empty($localAddr) || empty($remoteAddr) || empty($stateHex) || empty($inode)) {
-                continue;
+        return filter_var($input, FILTER_VALIDATE_IP) !== false;
+    }
+    
+    public static function validateInterval($interval): int {
+        if (!is_numeric($interval) || $interval < 1 || $interval > 3600) {
+            throw new InvalidArgumentException("Interval must be between 1 and 3600 seconds");
+        }
+        return (int)$interval;
+    }
+}
+
+class ProcessCache {
+    private static $cache = [];
+    private static $lastBuild = 0;
+
+    public static function getProcessMap(): array {
+        $now = time();
+        if (empty(self::$cache) || ($now - self::$lastBuild) > Config::get('process_cache_ttl')) {
+            self::$cache = self::buildProcessMap();
+            self::$lastBuild = $now;
+        }
+        return self::$cache;
+    }
+
+    private static function buildProcessMap(): array {
+        $processMap = [];
+        $inodes = self::extractInodesFromProcNet();
+
+        $procDir = @opendir('/proc');
+        if ($procDir === false) {
+            return $processMap;
+        }
+
+        while (($entry = readdir($procDir)) !== false) {
+            if (!ctype_digit($entry)) continue;
+
+            $pid = (int)$entry;
+            $processDir = "/proc/{$pid}";
+
+            if (!is_dir($processDir)) continue;
+
+            $foundInodes = self::scanProcessInodes($pid, $inodes);
+            if (!empty($foundInodes)) {
+                $processName = self::getProcessName($pid);
+                foreach ($foundInodes as $inode) {
+                    $processMap[$inode] = $processName;
+                }
             }
+        }
+
+        closedir($procDir);
+        return $processMap;
+    }
+    
+    private static function extractInodesFromProcNet(): array {
+        $inodes = [];
+        $files = ['/proc/net/tcp', '/proc/net/tcp6'];
+        
+        foreach ($files as $file) {
+            if (!file_exists($file)) continue;
             
-            $localParts = explode(':', $localAddr);
-            $remoteParts = explode(':', $remoteAddr);
-            
-            if (count($localParts) < 2 || count($remoteParts) < 2) {
-                continue;
+            $content = file_get_contents($file);
+            preg_match_all('/\s+\d+:\s+[0-9A-F:]+\\s+[0-9A-F:]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+(\d+)/', $content, $matches);
+            if (!empty($matches[1])) {
+                $inodes = array_merge($inodes, $matches[1]);
             }
-            
-            $localIpHex = $localParts[0];
-            $localPortHex = $localParts[1];
-            $remoteIpHex = $remoteParts[0];
-            $remotePortHex = $remoteParts[1];
-            
-            $localPort = $this->hexToDec($localPortHex);
-            $remotePort = $this->hexToDec($remotePortHex);
-            
-            if ($proto === 'tcp') {
-                $state = self::TCP_STATES[$stateHex] ?? 'UNKNOWN';
+        }
+        
+        return array_flip($inodes);
+    }
+    
+    private static function scanProcessInodes(int $pid, array $targetInodes): array {
+        $foundInodes = [];
+        $fdPath = "/proc/{$pid}/fd";
+        
+        if (!is_dir($fdPath)) return $foundInodes;
+
+        $fdDir = @opendir($fdPath);
+        if ($fdDir === false) return $foundInodes;
+
+        while (($fd = readdir($fdDir)) !== false) {
+            if ($fd === '.' || $fd === '..') continue;
+
+            $link = @readlink($fdPath . '/' . $fd);
+            if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
+                $inode = $matches[1];
+                if (isset($targetInodes[$inode])) {
+                    $foundInodes[] = $inode;
+                }
+            }
+        }
+
+        closedir($fdDir);
+        return $foundInodes;
+    }
+    
+    private static function getProcessName(int $pid): string {
+        $commPath = "/proc/{$pid}/comm";
+        $processName = @file_get_contents($commPath);
+        return $processName ? trim($processName) . " (PID: $pid)" : "PID: $pid";
+    }
+}
+
+class IPUtils {
+    public static function hexToIpv4(string $hex): string {
+        if (strlen($hex) !== 8) return '0.0.0.0';
+
+        $parts = [];
+        for ($i = 0; $i < 8; $i += 2) {
+            $parts[] = hexdec(substr($hex, $i, 2));
+        }
+
+        return implode('.', array_reverse($parts));
+    }
+
+    public static function hexToIpv6(string $hex): string {
+        $hex = preg_replace('/[^0-9A-Fa-f]/', '', $hex);
+        if (strlen($hex) !== 32) return '::';
+
+        $blocks = str_split($hex, 8);
+        $blocks = array_reverse($blocks);
+        $reordered = implode('', $blocks);
+        $packed = pack('H*', $reordered);
+        $addr = @inet_ntop($packed);
+        return $addr ?: '::';
+    }
+
+    public static function ipInCidr(string $ip, string $cidr): bool {
+        list($subnet, $mask) = explode('/', $cidr);
+        $mask = (int)$mask;
+
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return self::ipv4InCidr($ip, $subnet, $mask);
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return self::ipv6InCidr($ip, $subnet, $mask);
+        }
+
+        return false;
+    }
+
+    private static function ipv4InCidr(string $ip, string $subnet, int $mask): bool {
+        if ($mask <= 0) return true;
+        if ($mask >= 32) return $ip === $subnet;
+
+        $ipLong = ip2long($ip);
+        $subnetLong = ip2long($subnet);
+
+        if ($ipLong === false || $subnetLong === false) return false;
+
+        if (PHP_INT_SIZE === 4) {
+            $maskLong = ($mask === 0) ? 0 : (0xFFFFFFFF << (32 - $mask));
+            return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
+        } else {
+            $maskLong = ($mask === 0) ? 0 : ((0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF);
+            return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
+        }
+    }
+
+    private static function ipv6InCidr(string $ip, string $subnet, int $mask): bool {
+        $ipBin = inet_pton($ip);
+        $subnetBin = inet_pton($subnet);
+
+        if ($ipBin === false || $subnetBin === false) return false;
+        if ($mask === 0) return true;
+
+        $bytes = (int)ceil($mask / 8);
+        for ($i = 0; $i < $bytes; $i++) {
+            $ipByte = ord($ipBin[$i]);
+            $subnetByte = ord($subnetBin[$i]);
+
+            if ($i === $bytes - 1 && ($mask % 8) !== 0) {
+                $bits = $mask % 8;
+                $maskByte = (0xFF << (8 - $bits)) & 0xFF;
+                if (($ipByte & $maskByte) !== ($subnetByte & $maskByte)) return false;
             } else {
-                $state = self::UDP_STATES[$stateHex] ?? 'UNCONNECTED';
+                if ($ipByte !== $subnetByte) return false;
             }
-            
-            if ($family === 'ipv4') {
-                $localIp = $this->hexToIpv4($localIpHex);
-                $remoteIp = $this->hexToIpv4($remoteIpHex);
-            } else {
-                $localIp = $this->hexToIpv6($localIpHex);
-                $remoteIp = $this->hexToIpv6($remoteIpHex);
-            }
-            
-            $process = '';
-            if ($this->config['show_processes']) {
-                $process = $this->getProcessByInode($inode);
-            }
-            
-            $connections[] = [
-                'proto_type' => $proto,
-                'family' => $family,
-                'state' => $state,
-                'local_ip' => $localIp,
-                'local_port' => $localPort,
-                'remote_ip' => $remoteIp,
-                'remote_port' => $remotePort,
-                'inode' => $inode,
-                'process' => $process
+        }
+
+        return true;
+    }
+}
+
+class ConnectionCache {
+    private static $cache = [];
+    
+    public static function getConnections(string $file, int $family, bool $includeProcess = false): array {
+        $key = $file . '_' . $family . '_' . (int)$includeProcess;
+        $mtime = @filemtime($file);
+        
+        if ($mtime === false) return [];
+        
+        $cacheKey = $key . '_' . $mtime;
+        
+        if (!isset(self::$cache[$cacheKey]) || (time() - self::$cache[$cacheKey]['timestamp']) > Config::get('connection_cache_ttl')) {
+            self::$cache[$cacheKey] = [
+                'data' => self::readConnections($file, $family, $includeProcess),
+                'timestamp' => time()
             ];
         }
         
-        $this->connectionCache[$cacheKey] = $connections;
-        $this->connectionCache[$cacheKey . '_mtime'] = $fileMtime;
-        $this->lastConnectionScan = $currentTime;
-        
+        return self::$cache[$cacheKey]['data'];
+    }
+    
+    private static function readConnections(string $file, int $family, bool $includeProcess): array {
+        if (!Security::validatePath($file)) {
+            throw new RuntimeException("Invalid file path: $file");
+        }
+
+        if (!file_exists($file)) throw new RuntimeException("File $file does not exist");
+        if (!is_readable($file)) throw new RuntimeException("File $file is not readable");
+
+        $handle = @fopen($file, 'r');
+        if ($handle === false) throw new RuntimeException("Unable to read $file");
+
+        $processMap = $includeProcess ? ProcessCache::getProcessMap() : null;
+        fgets($handle);
+
+        $connections = [];
+        while (($line = fgets($handle)) !== false) {
+            PerformanceTracker::recordOperation();
+            $line = trim($line);
+            if (empty($line)) continue;
+
+            $fields = preg_split('/\s+/', $line);
+            if (count($fields) < 10) continue;
+
+            $connection = self::parseConnectionLine($fields, $family, $processMap);
+            if ($connection) $connections[] = $connection;
+        }
+
+        fclose($handle);
         return $connections;
     }
+    
+    private static function parseConnectionLine(array $fields, int $family, ?array $processMap): ?array {
+        list($localIpHex, $localPortHex) = explode(':', $fields[1], 2);
+        list($remoteIpHex, $remotePortHex) = explode(':', $fields[2], 2);
 
-    private function filterConnections(array $connections): array {
-        return array_filter($connections, function($conn) {
-            // State filter
-            if (!empty($this->config['filter_states'])) {
-                if (!in_array($conn['state'], $this->config['filter_states'])) {
-                    return false;
-                }
+        if ($family === AF_INET) {
+            $localIp = IPUtils::hexToIpv4($localIpHex);
+            $remoteIp = IPUtils::hexToIpv4($remoteIpHex);
+        } else {
+            $localIp = IPUtils::hexToIpv6($localIpHex);
+            $remoteIp = IPUtils::hexToIpv6($remoteIpHex);
+        }
+
+        $localPort = hexdec($localPortHex);
+        $remotePort = hexdec($remotePortHex);
+        $stateCode = strtoupper($fields[3]);
+        $state = TCP_STATES[$stateCode] ?? "UNKNOWN(0x$stateCode)";
+        $proto = ($family === AF_INET) ? 'IPv4' : 'IPv6';
+        $inode = $fields[9];
+        $process = $processMap ? self::getProcessByInode($inode, $processMap) : '';
+
+        return [
+            'proto'       => $proto,
+            'state'       => $state,
+            'local_ip'    => $localIp,
+            'local_port'  => $localPort,
+            'remote_ip'   => $remoteIp,
+            'remote_port' => $remotePort,
+            'inode'       => $inode,
+            'process'     => $process,
+        ];
+    }
+    
+    private static function getProcessByInode($inode, array $processMap): string {
+        static $processCache = [];
+        
+        if (isset($processCache[$inode])) return $processCache[$inode];
+        if (isset($processMap[$inode])) {
+            $processCache[$inode] = $processMap[$inode];
+            return $processMap[$inode];
+        }
+
+        $processCache[$inode] = "unknown";
+        return "unknown";
+    }
+}
+
+class OutputFormatter {
+    public static function formatTable(array $connections, bool $showProcess = false): string {
+        if (empty($connections)) return "No connections found.\n";
+
+        self::sortConnections($connections);
+        $output = "\nACTIVE TCP CONNECTIONS:\n";
+
+        if ($showProcess) {
+            $output .= sprintf("%-5s %-15s %-25s %-25s %-30s\n", "Proto", "State", "Local Address", "Remote Address", "Process");
+            $output .= str_repeat("-", 105) . "\n";
+            foreach ($connections as $c) {
+                $color = self::getStateColor($c['state']);
+                $reset = COLORS['reset'];
+                $output .= sprintf(
+                    "%-5s {$color}%-15s{$reset} %-25s %-25s %-30s\n",
+                    $c['proto'],
+                    $c['state'],
+                    "{$c['local_ip']}:{$c['local_port']}",
+                    "{$c['remote_ip']}:{$c['remote_port']}",
+                    substr($c['process'], 0, 30)
+                );
             }
-            
-            // Port filter
-            if (!empty($this->config['filter_port'])) {
-                $filterPort = (int)$this->config['filter_port'];
-                if ($conn['local_port'] !== $filterPort && $conn['remote_port'] !== $filterPort) {
-                    return false;
-                }
+        } else {
+            $output .= sprintf("%-5s %-15s %-25s %-25s\n", "Proto", "State", "Local Address", "Remote Address");
+            $output .= str_repeat("-", 75) . "\n";
+            foreach ($connections as $c) {
+                $color = self::getStateColor($c['state']);
+                $reset = COLORS['reset'];
+                $output .= sprintf(
+                    "%-5s {$color}%-15s{$reset} %-25s %-25s\n",
+                    $c['proto'],
+                    $c['state'],
+                    "{$c['local_ip']}:{$c['local_port']}",
+                    "{$c['remote_ip']}:{$c['remote_port']}"
+                );
             }
-            
-            // Local IP filter
-            if (!empty($this->config['filter_local_ip'])) {
-                if (!$this->ipMatchesFilter($conn['local_ip'], $this->config['filter_local_ip'], $conn['family'])) {
-                    return false;
-                }
-            }
-            
-            // Remote IP filter
-            if (!empty($this->config['filter_remote_ip'])) {
-                if (!$this->ipMatchesFilter($conn['remote_ip'], $this->config['filter_remote_ip'], $conn['family'])) {
-                    return false;
-                }
-            }
-            
-            // IP version filter
-            if ($this->config['filter_ipv4'] && $conn['family'] !== 'ipv4') {
-                return false;
-            }
-            if ($this->config['filter_ipv6'] && $conn['family'] !== 'ipv6') {
-                return false;
-            }
-            
-            return true;
-        });
+        }
+
+        $stats = self::getConnectionStats($connections);
+        $output .= self::formatSummary($stats);
+        return $output;
     }
 
-    private function getAllConnections(): array {
-        $connections = [];
+    public static function formatJson(array $connections, bool $includeStats = false): string {
+        if ($includeStats) {
+            $output = [
+                'connections' => $connections,
+                'statistics' => self::getConnectionStats($connections),
+                'metadata' => [
+                    'generated_at' => date('c'),
+                    'count' => count($connections)
+                ]
+            ];
+        } else {
+            $output = $connections;
+        }
+
+        return json_encode($output, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
+    }
+
+    public static function formatCsv(array $connections): string {
+        if (empty($connections)) return "";
+        $output = "Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode\n";
         
-        if ($this->config['show_udp']) {
-            $connections = array_merge(
-                $connections,
-                $this->parseProtoFile('/proc/net/udp', 'ipv4', 'udp'),
-                $this->parseProtoFile('/proc/net/udp6', 'ipv6', 'udp')
+        foreach ($connections as $conn) {
+            $output .= sprintf(
+                "%s,%s,%s,%d,%s,%d,%s,%s\n",
+                $conn['proto'],
+                $conn['state'],
+                $conn['local_ip'],
+                $conn['local_port'],
+                $conn['remote_ip'],
+                $conn['remote_port'],
+                self::escapeCsvField($conn['process']),
+                $conn['inode']
             );
         }
         
-        $connections = array_merge(
-            $connections,
-            $this->parseProtoFile('/proc/net/tcp', 'ipv4', 'tcp'),
-            $this->parseProtoFile('/proc/net/tcp6', 'ipv6', 'tcp')
-        );
-        
-        return $this->filterConnections($connections);
+        return $output;
     }
 
-    private function getConnectionStats(array $connections): array {
+    public static function formatStatistics(array $connections): string {
+        $stats = self::getConnectionStats($connections);
+        $output = "\nDETAILED TCP CONNECTION STATISTICS\n";
+        $output .= str_repeat("=", 50) . "\n";
+        $output .= "Generated at: " . $stats['timestamp'] . "\n";
+        $output .= "Total connections: " . $stats['total'] . "\n";
+        $output .= "IPv4 connections: " . $stats['ipv4'] . "\n";
+        $output .= "IPv6 connections: " . $stats['ipv6'] . "\n\n";
+
+        $output .= "Connections by State:\n";
+        $output .= str_repeat("-", 30) . "\n";
+        foreach ($stats['by_state'] as $state => $count) {
+            $color = self::getStateColor($state);
+            $reset = COLORS['reset'];
+            $output .= sprintf("{$color}%-20s{$reset}: %d\n", $state, $count);
+        }
+
+        if (!empty($stats['by_process'])) {
+            $output .= "\nConnections by Process (Top 10):\n";
+            $output .= str_repeat("-", 50) . "\n";
+
+            uasort($stats['by_process'], function($a, $b) {
+                return $b <=> $a;
+            });
+
+            $count = 0;
+            foreach ($stats['by_process'] as $process => $connCount) {
+                $output .= sprintf("%-40s: %d\n", $process, $connCount);
+                if (++$count >= 10) break;
+            }
+        }
+        
+        return $output;
+    }
+
+    public static function getConnectionStats(array $connections): array {
         $stats = [
-            'total' => 0,
-            'tcp' => 0,
-            'udp' => 0,
+            'total' => count($connections),
             'ipv4' => 0,
             'ipv6' => 0,
-            'states' => [],
-            'processes' => []
+            'by_state' => [],
+            'by_process' => [],
+            'timestamp' => date('c')
         ];
-        
+
         foreach ($connections as $conn) {
-            $stats['total']++;
-            
-            if ($conn['proto_type'] === 'tcp') {
-                $stats['tcp']++;
-            } else {
-                $stats['udp']++;
-            }
-            
-            if ($conn['family'] === 'ipv4') {
+            if ($conn['proto'] === 'IPv4') {
                 $stats['ipv4']++;
             } else {
                 $stats['ipv6']++;
             }
-            
-            $state = $conn['state'];
-            $stats['states'][$state] = ($stats['states'][$state] ?? 0) + 1;
-            
-            $process = $conn['process'];
-            if ($process && $process !== 'unknown') {
-                $stats['processes'][$process] = ($stats['processes'][$process] ?? 0) + 1;
+
+            $stats['by_state'][$conn['state']] = ($stats['by_state'][$conn['state']] ?? 0) + 1;
+
+            if (!empty($conn['process'])) {
+                $stats['by_process'][$conn['process']] = ($stats['by_process'][$conn['process']] ?? 0) + 1;
             }
         }
-        
+
         return $stats;
     }
 
-    private function checkAlert(array $stats, string $alertState, int $threshold): bool {
-        $count = $stats['states'][$alertState] ?? 0;
-        if ($count > $threshold) {
-            echo self::RED . "ALERT: $alertState connections ($count) exceed threshold ($threshold)!" . self::RESET . PHP_EOL;
-            return true;
-        }
-        return false;
-    }
-
-    private function coloredState(string $state): string {
-        $color = self::STATE_COLORS[$state] ?? self::WHITE;
-        return $color . $state . self::RESET;
-    }
-
-    private function displayConnectionsTable(array $connections): string {
-        $output = self::BOLD . "ACTIVE CONNECTIONS (TCP/UDP)" . self::RESET . PHP_EOL . PHP_EOL;
-        
-        if ($this->config['show_processes']) {
-            $output .= sprintf("%-6s %-6s %-15s %-25s %-25s %-30s\n", 
-                "Proto", "Family", "State", "Local Address", "Remote Address", "Process");
-            $output .= str_repeat('-', 120) . PHP_EOL;
-        } else {
-            $output .= sprintf("%-6s %-6s %-15s %-25s %-25s\n", 
-                "Proto", "Family", "State", "Local Address", "Remote Address");
-            $output .= str_repeat('-', 85) . PHP_EOL;
-        }
-        
-        foreach ($connections as $conn) {
-            $localAddr = $conn['local_ip'] . ':' . $conn['local_port'];
-            $remoteAddr = $conn['remote_ip'] . ':' . $conn['remote_port'];
-            
-            if ($this->config['show_processes']) {
-                $output .= sprintf("%-6s %-6s %s %-25s %-25s %-30s\n",
-                    strtoupper($conn['proto_type']),
-                    strtoupper($conn['family']),
-                    $this->coloredState($conn['state']),
-                    $localAddr,
-                    $remoteAddr,
-                    substr($conn['process'], 0, 30)
-                );
-            } else {
-                $output .= sprintf("%-6s %-6s %s %-25s %-25s\n",
-                    strtoupper($conn['proto_type']),
-                    strtoupper($conn['family']),
-                    $this->coloredState($conn['state']),
-                    $localAddr,
-                    $remoteAddr
-                );
+    public static function displayStateSummary(array $stats): void {
+        if (!empty($stats['by_state'])) {
+            echo "By state: ";
+            $stateStrings = [];
+            foreach ($stats['by_state'] as $state => $count) {
+                $color = self::getStateColor($state);
+                $reset = COLORS['reset'];
+                $stateStrings[] = "{$color}{$state}{$reset}: $count";
             }
-        }
-        
-        return $output;
-    }
-
-    private function displaySummary(array $connections): string {
-        $stats = $this->getConnectionStats($connections);
-        $output = self::BOLD . "Summary:" . self::RESET . " {$stats['total']} total connections ";
-        $output .= "({$stats['tcp']} TCP, {$stats['udp']} UDP; {$stats['ipv4']} IPv4, {$stats['ipv6']} IPv6)" . PHP_EOL;
-        
-        if (!empty($stats['states'])) {
-            $output .= "By state: ";
-            $stateParts = [];
-            foreach ($stats['states'] as $state => $count) {
-                $stateParts[] = $this->coloredState($state) . ": $count";
-            }
-            $output .= implode(', ', $stateParts) . PHP_EOL;
-        }
-        
-        return $output;
-    }
-
-    private function displayConnectionsJson(array $connections): string {
-        return json_encode($connections, JSON_PRETTY_PRINT);
-    }
-
-    private function displayConnectionsCsv(array $connections): string {
-        $output = "Proto,Family,State,Local IP,Local Port,Remote IP,Remote Port,Inode,Process\n";
-        
-        foreach ($connections as $conn) {
-            $escapedLocalIp = str_replace(',', '&#44;', $conn['local_ip']);
-            $escapedRemoteIp = str_replace(',', '&#44;', $conn['remote_ip']);
-            $escapedProcess = str_replace(',', '&#44;', $conn['process']);
-            
-            $output .= sprintf('"%s","%s","%s","%s",%d,"%s",%d,"%s","%s"' . PHP_EOL,
-                strtoupper($conn['proto_type']),
-                strtoupper($conn['family']),
-                $conn['state'],
-                $escapedLocalIp,
-                $conn['local_port'],
-                $escapedRemoteIp,
-                $conn['remote_port'],
-                $conn['inode'],
-                $escapedProcess
-            );
-        }
-        
-        return $output;
-    }
-
-    private function displayStatistics(array $connections): string {
-        $stats = $this->getConnectionStats($connections);
-        $output = self::BOLD . "DETAILED CONNECTION STATISTICS" . self::RESET . PHP_EOL;
-        $output .= str_repeat('=', 55) . PHP_EOL;
-        
-        $output .= "Generated at: " . date('c') . PHP_EOL;
-        $output .= "Total connections: {$stats['total']}" . PHP_EOL;
-        $output .= "TCP connections: {$stats['tcp']}" . PHP_EOL;
-        $output .= "UDP connections: {$stats['udp']}" . PHP_EOL;
-        $output .= "IPv4 connections: {$stats['ipv4']}" . PHP_EOL;
-        $output .= "IPv6 connections: {$stats['ipv6']}" . PHP_EOL;
-        
-        $output .= PHP_EOL . self::BOLD . "Connections by State:" . self::RESET . PHP_EOL;
-        $output .= str_repeat('-', 30) . PHP_EOL;
-        
-        arsort($stats['states']);
-        foreach ($stats['states'] as $state => $count) {
-            $output .= sprintf("%-20s: %d\n", $this->coloredState($state), $count);
-        }
-        
-        $output .= PHP_EOL . self::BOLD . "Connections by Process (Top {$this->config['max_display_processes']}):" . self::RESET . PHP_EOL;
-        $output .= str_repeat('-', 55) . PHP_EOL;
-        
-        arsort($stats['processes']);
-        $count = 0;
-        foreach ($stats['processes'] as $process => $processCount) {
-            if ($count++ >= $this->config['max_display_processes']) break;
-            $output .= sprintf("%-45s: %d\n", $process, $processCount);
-        }
-        
-        return $output;
-    }
-
-    private function outputToFile(string $content, string $file): void {
-        if (file_put_contents($file, $content) === false) {
-            $this->die("Failed to write output to: $file");
-        }
-        echo "Output written to: $file" . PHP_EOL;
-    }
-
-    private function parseArguments(array $argv): void {
-        $args = array_slice($argv, 1);
-        
-        for ($i = 0; $i < count($args); $i++) {
-            $arg = $args[$i];
-            
-            switch ($arg) {
-                case '--json':
-                    $this->config['json_output'] = true;
-                    break;
-                case '--csv':
-                    $this->config['csv_output'] = true;
-                    break;
-                case '--udp':
-                    $this->config['show_udp'] = true;
-                    break;
-                case '--listen':
-                    $this->config['filter_states'][] = 'LISTEN';
-                    break;
-                case '--established':
-                    $this->config['filter_states'][] = 'ESTABLISHED';
-                    break;
-                case '--timewait':
-                    $this->config['filter_states'][] = 'TIME_WAIT';
-                    break;
-                case '--closewait':
-                    $this->config['filter_states'][] = 'CLOSE_WAIT';
-                    break;
-                case '--finwait':
-                    $this->config['filter_states'] = array_merge($this->config['filter_states'], ['FIN_WAIT1', 'FIN_WAIT2']);
-                    break;
-                case '--count':
-                    $this->config['show_count'] = true;
-                    break;
-                case '--processes':
-                    $this->config['show_processes'] = true;
-                    break;
-                case '--port':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("Port number required for --port");
-                    }
-                    $this->config['filter_port'] = $args[++$i];
-                    $this->validatePort((int)$this->config['filter_port']);
-                    break;
-                case '--local-ip':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("IP address required for --local-ip");
-                    }
-                    $this->config['filter_local_ip'] = $args[++$i];
-                    $this->validateIpCidr($this->config['filter_local_ip']);
-                    break;
-                case '--remote-ip':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("IP address required for --remote-ip");
-                    }
-                    $this->config['filter_remote_ip'] = $args[++$i];
-                    $this->validateIpCidr($this->config['filter_remote_ip']);
-                    break;
-                case '--ipv4':
-                    $this->config['filter_ipv4'] = true;
-                    break;
-                case '--ipv6':
-                    $this->config['filter_ipv6'] = true;
-                    break;
-                case '--watch':
-                    $this->config['watch_mode'] = true;
-                    if (isset($args[$i + 1]) && ctype_digit($args[$i + 1])) {
-                        $this->config['refresh_interval'] = (int)$args[++$i];
-                        $this->validateInterval($this->config['refresh_interval']);
-                    }
-                    break;
-                case '--stats':
-                    $this->config['show_stats'] = true;
-                    break;
-                case '--alert-state':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("State required for --alert-state");
-                    }
-                    $this->config['alert_state'] = $args[++$i];
-                    $this->config['alert_mode'] = true;
-                    break;
-                case '--alert-threshold':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("Threshold required for --alert-threshold");
-                    }
-                    $this->config['alert_threshold'] = (int)$args[++$i];
-                    $this->validateThreshold($this->config['alert_threshold']);
-                    break;
-                case '--output':
-                    if (!isset($args[$i + 1])) {
-                        $this->die("Filename required for --output");
-                    }
-                    $this->config['output_file'] = $args[++$i];
-                    break;
-                case '--verbose':
-                case '-v':
-                    $this->config['verbose'] = true;
-                    break;
-                case '--version':
-                    $this->showVersion();
-                    break;
-                case '--help':
-                    $this->showHelp();
-                    exit(0);
-                default:
-                    if ($arg) {
-                        $this->die("Unknown option: $arg\nUse --help for usage information");
-                    }
-                    break;
-            }
+            echo implode(", ", $stateStrings) . "\n";
         }
     }
 
-    private function watchMode(int $interval): void {
-        declare(ticks=1);
-        pcntl_signal(SIGINT, function() {
-            echo PHP_EOL . self::YELLOW . "Monitoring stopped." . self::RESET . PHP_EOL;
-            exit(0);
+    private static function sortConnections(array &$connections): void {
+        usort($connections, function ($a, $b) {
+            return $a['local_port'] <=> $b['local_port'] ?:
+                   strcmp($a['proto'], $b['proto']);
         });
+    }
+
+    private static function getStateColor(string $state): string {
+        return COLORS[$state] ?? "\033[37m";
+    }
+
+    private static function formatSummary(array $stats): string {
+        $output = "\nSummary: " . $stats['total'] . " total connections ({$stats['ipv4']} IPv4, {$stats['ipv6']} IPv6)\n";
+
+        if (!empty($stats['by_state'])) {
+            $output .= "By state: ";
+            $stateStrings = [];
+            foreach ($stats['by_state'] as $state => $count) {
+                $color = self::getStateColor($state);
+                $reset = COLORS['reset'];
+                $stateStrings[] = "{$color}{$state}{$reset}: $count";
+            }
+            $output .= implode(", ", $stateStrings) . "\n";
+        }
         
-        echo self::BOLD . "Watching connections" . self::RESET . " (refresh every {$interval}s). Press Ctrl+C to stop." . PHP_EOL;
-        echo "Started at: " . date('Y-m-d H:i:s') . PHP_EOL . PHP_EOL;
-        
-        $isTty = function_exists('posix_isatty') && posix_isatty(STDOUT);
-        $iteration = 0;
-        
-        while (true) {
-            $iteration++;
-            $connections = $this->getAllConnections();
-            $currentCount = count($connections);
+        return $output;
+    }
+
+    private static function escapeCsvField(string $field): string {
+        if (strpos($field, ',') !== false || strpos($field, '"') !== false || strpos($field, "\n") !== false) {
+            return '"' . str_replace('"', '""', $field) . '"';
+        }
+        return $field;
+    }
+}
+
+class ConnectionFilter {
+    public static function filter(array $connections, array $options): array {
+        $filtered = $connections;
+
+        $states = self::getRequestedStates($options);
+        if ($states) {
+            $filtered = array_filter($filtered, fn($c) => in_array($c['state'], $states, true));
+        }
+
+        if (isset($options['port'])) {
+            $port = InputValidator::validatePort($options['port']);
+            $filtered = array_filter($filtered, fn($c) =>
+                $c['local_port'] === $port || $c['remote_port'] === $port);
+        }
+
+        if (isset($options['local-ip'])) {
+            $localIp = InputValidator::validateIpFilter($options['local-ip']);
+            $filtered = array_filter($filtered, fn($c) =>
+                self::ipMatchesFilter($c['local_ip'], $localIp));
+        }
+
+        if (isset($options['remote-ip'])) {
+            $remoteIp = InputValidator::validateIpFilter($options['remote-ip']);
+            $filtered = array_filter($filtered, fn($c) =>
+                self::ipMatchesFilter($c['remote_ip'], $remoteIp));
+        }
+
+        if (isset($options['ipv4'])) {
+            $filtered = array_filter($filtered, fn($c) => $c['proto'] === 'IPv4');
+        }
+
+        if (isset($options['ipv6'])) {
+            $filtered = array_filter($filtered, fn($c) => $c['proto'] === 'IPv6');
+        }
+
+        return array_values($filtered);
+    }
+
+    private static function getRequestedStates(array $options): array {
+        $states = [];
+        if (isset($options['listen'])) $states[] = 'LISTEN';
+        if (isset($options['established'])) $states[] = 'ESTABLISHED';
+        if (isset($options['timewait'])) $states[] = 'TIME_WAIT';
+        if (isset($options['closewait'])) $states[] = 'CLOSE_WAIT';
+        if (isset($options['finwait'])) {
+            $states[] = 'FIN_WAIT1';
+            $states[] = 'FIN_WAIT2';
+        }
+        return $states;
+    }
+
+    private static function ipMatchesFilter(string $ip, string $filter): bool {
+        if ($ip === $filter) return true;
+        if (strpos($filter, '/') !== false) return IPUtils::ipInCidr($ip, $filter);
+        return strpos($ip, $filter) !== false;
+    }
+}
+
+class ConnectionHistory {
+    private static $history = [];
+
+    public static function trackChanges(array $current): array {
+        $changes = [
+            'timestamp' => time(),
+            'total' => count($current),
+            'added' => [],
+            'removed' => []
+        ];
+
+        if (!empty(self::$history)) {
+            $previous = end(self::$history);
+            $currentKeys = array_map('self::getConnectionKey', $current);
+            $previousKeys = array_map('self::getConnectionKey', $previous['connections']);
             
-            if ($isTty) {
-                system('clear');
-            }
-            
-            echo self::BOLD . "[" . date('H:i:s') . "] Iteration: $iteration | Connections: $currentCount" . self::RESET . PHP_EOL;
-            echo str_repeat('-', 65) . PHP_EOL . PHP_EOL;
-            
-            if ($this->config['json_output']) {
-                echo $this->displayConnectionsJson($connections) . PHP_EOL;
-            } elseif ($this->config['csv_output']) {
-                echo $this->displayConnectionsCsv($connections) . PHP_EOL;
-            } else {
-                echo $this->displayConnectionsTable($connections);
-                echo $this->displaySummary($connections) . PHP_EOL;
-            }
-            
-            if ($this->config['show_stats']) {
-                echo $this->displayStatistics($connections) . PHP_EOL;
-            }
-            
-            if ($this->config['alert_mode'] && $this->config['alert_state'] && $this->config['alert_threshold'] > 0) {
-                $stats = $this->getConnectionStats($connections);
-                $this->checkAlert($stats, $this->config['alert_state'], $this->config['alert_threshold']);
-            }
-            
-            sleep($interval);
+            $changes['added'] = array_diff($currentKeys, $previousKeys);
+            $changes['removed'] = array_diff($previousKeys, $currentKeys);
+        }
+
+        self::$history[] = ['connections' => $current, 'changes' => $changes];
+        if (count(self::$history) > Config::get('max_history')) {
+            array_shift(self::$history);
+        }
+
+        return $changes;
+    }
+
+    private static function getConnectionKey(array $conn): string {
+        return "{$conn['local_ip']}:{$conn['local_port']}-{$conn['remote_ip']}:{$conn['remote_port']}-{$conn['state']}";
+    }
+}
+
+class SignalHandler {
+    private static $shouldExit = false;
+    private static $startTime;
+
+    public static function init(): void {
+        self::$startTime = time();
+
+        if (function_exists('pcntl_signal')) {
+            pcntl_signal(SIGINT, [self::class, 'handleSignal']);
+            pcntl_signal(SIGTERM, [self::class, 'handleSignal']);
         }
     }
 
-    public function run(array $argv): void {
-        $this->parseArguments($argv);
-        $this->checkRequirements();
-        
-        if ($this->config['watch_mode']) {
-            $this->watchMode($this->config['refresh_interval']);
-            return;
+    public static function handleSignal(int $signo): void {
+        self::$shouldExit = true;
+        $duration = time() - self::$startTime;
+        echo "\n\nMonitoring stopped after {$duration} seconds.\n";
+        exit(0);
+    }
+
+    public static function shouldExit(): bool {
+        if (function_exists('pcntl_signal_dispatch')) {
+            pcntl_signal_dispatch();
         }
-        
-        $connections = $this->getAllConnections();
-        
-        if (empty($connections)) {
-            echo "No matching connections found." . PHP_EOL;
-            return;
+        return self::$shouldExit;
+    }
+}
+
+class TCPConnectionMonitor {
+    private $options;
+    
+    public function __construct(array $options = []) {
+        $this->options = $options;
+    }
+    
+    public function getConnections(): array {
+        if (!RateLimiter::checkLimit()) {
+            throw new RuntimeException("Rate limit exceeded");
         }
-        
-        $stats = $this->getConnectionStats($connections);
-        
-        if ($this->config['alert_mode'] && $this->config['alert_state'] && $this->config['alert_threshold'] > 0) {
-            $this->checkAlert($stats, $this->config['alert_state'], $this->config['alert_threshold']);
-        }
-        
-        $output = '';
-        
-        if ($this->config['show_count']) {
-            $output = "Counts: total={$stats['total']} tcp={$stats['tcp']} udp={$stats['udp']} IPv4={$stats['ipv4']} IPv6={$stats['ipv6']}" . PHP_EOL;
-            
-            if (!empty($stats['states'])) {
-                $output .= "By state: ";
-                $stateParts = [];
-                foreach ($stats['states'] as $state => $count) {
-                    $stateParts[] = $this->coloredState($state) . ": $count";
-                }
-                $output .= implode(', ', $stateParts) . PHP_EOL;
+
+        $includeProcess = isset($this->options['processes']);
+
+        $connections = array_merge(
+            ConnectionCache::getConnections('/proc/net/tcp', AF_INET, $includeProcess),
+            ConnectionCache::getConnections('/proc/net/tcp6', AF_INET6, $includeProcess)
+        );
+
+        return ConnectionFilter::filter($connections, $this->options);
+    }
+    
+    public function getStatistics(): array {
+        $connections = $this->getConnections();
+        return [
+            'connections' => $connections,
+            'stats' => OutputFormatter::getConnectionStats($connections)
+        ];
+    }
+}
+
+class ConnectionWatcher {
+    private $monitor;
+    
+    public function __construct(TCPConnectionMonitor $monitor) {
+        $this->monitor = $monitor;
+    }
+    
+    public function watch(array $options, int $interval = 2): void {
+        $lastConnections = [];
+        $iteration = 0;
+
+        SignalHandler::init();
+
+        echo "Watching TCP connections (refresh every {$interval}s). Press Ctrl+C to stop.\n";
+        echo "Started at: " . date('Y-m-d H:i:s') . "\n\n";
+
+        while (!SignalHandler::shouldExit()) {
+            $iteration++;
+            echo "\033[2J\033[;H";
+
+            $connections = $this->monitor->getConnections();
+            $currentCount = count($connections);
+
+            $changes = ConnectionHistory::trackChanges($connections);
+            $this->displayChanges($changes, $iteration);
+
+            echo "[" . date('H:i:s') . "] Iteration: $iteration | Connections: $currentCount\n";
+            echo str_repeat("-", 60) . "\n";
+
+            if (isset($options['json'])) {
+                echo OutputFormatter::formatJson($connections, $options['stats'] ?? false);
+            } else {
+                echo OutputFormatter::formatTable($connections, $options['processes'] ?? false);
             }
-        } elseif ($this->config['show_stats']) {
-            $output = $this->displayStatistics($connections);
-        } elseif ($this->config['json_output']) {
-            $output = $this->displayConnectionsJson($connections);
-        } elseif ($this->config['csv_output']) {
-            $output = $this->displayConnectionsCsv($connections);
-        } else {
-            $output = $this->displayConnectionsTable($connections) . $this->displaySummary($connections);
+
+            $lastConnections = $connections;
+
+            $slept = 0;
+            while ($slept < $interval && !SignalHandler::shouldExit()) {
+                sleep(1);
+                $slept++;
+            }
+
+            if (SignalHandler::shouldExit()) break;
+        }
+    }
+    
+    private function displayChanges(array $changes, int $iteration): void {
+        if ($iteration === 1) return;
+
+        $totalChanges = count($changes['added']) + count($changes['removed']);
+        if ($totalChanges === 0) {
+            echo "No changes since last refresh\n";
+            return;
+        }
+
+        echo "Changes: \033[32m+" . count($changes['added']) . "\033[0m \033[31m-" . count($changes['removed']) . "\033[0m\n";
+
+        if (!empty($changes['added'])) {
+            echo "\033[32mNew connections:\033[0m\n";
+            foreach (array_slice($changes['added'], 0, 3) as $key) {
+                echo "  + $key\n";
+            }
+            if (count($changes['added']) > 3) {
+                echo "  ... and " . (count($changes['added']) - 3) . " more\n";
+            }
+        }
+
+        if (!empty($changes['removed'])) {
+            echo "\033[31mClosed connections:\033[0m\n";
+            foreach (array_slice($changes['removed'], 0, 3) as $key) {
+                echo "  - $key\n";
+            }
+            if (count($changes['removed']) > 3) {
+                echo "  ... and " . (count($changes['removed']) - 3) . " more\n";
+            }
+        }
+
+        echo "\n";
+    }
+}
+
+class OptionParser {
+    public static function parse(array $argv): array {
+        $script = basename($argv[0] ?? 'tcp_monitor.php');
+        
+        $options = getopt("jlpv", [
+            "json", "help", "listen", "established", "count", "processes",
+            "timewait", "closewait", "finwait", "port:", "watch::",
+            "local-ip:", "remote-ip:", "stats", "ipv4", "ipv6", "verbose",
+            "csv", "output:"
+        ]);
+
+        if (isset($options['help'])) {
+            self::displayHelp($script);
+            exit(0);
         }
         
-        if ($output) {
-            if ($this->config['output_file']) {
-                $this->outputToFile($output, $this->config['output_file']);
+        self::validateOptions($options);
+        return $options;
+    }
+    
+    private static function validateOptions(array &$options): void {
+        if (isset($options['port'])) {
+            $options['port'] = InputValidator::validatePort($options['port']);
+        }
+        
+        if (isset($options['watch']) && $options['watch'] !== false) {
+            $interval = $options['watch'] === false ? 2 : $options['watch'];
+            $options['watch_interval'] = InputValidator::validateInterval($interval);
+        }
+        
+        if (isset($options['local-ip'])) {
+            $options['local-ip'] = InputValidator::validateIpFilter($options['local-ip']);
+        }
+        
+        if (isset($options['remote-ip'])) {
+            $options['remote-ip'] = InputValidator::validateIpFilter($options['remote-ip']);
+        }
+    }
+    
+    private static function displayHelp(string $script): void {
+        echo "Usage: php {$script} [options]\n";
+        echo "Options:\n";
+        echo "  --json         Output connections in JSON format\n";
+        echo "  --csv          Output connections in CSV format\n";
+        echo "  --listen       Show only listening sockets\n";
+        echo "  --established  Show only established connections\n";
+        echo "  --timewait     Show only TIME_WAIT connections\n";
+        echo "  --closewait    Show only CLOSE_WAIT connections\n";
+        echo "  --finwait      Show only FIN_WAIT1/FIN_WAIT2 connections\n";
+        echo "  --count        Only show counts (IPv4/IPv6/total)\n";
+        echo "  --processes    Show process information (slower)\n";
+        echo "  --port <num>   Filter by port number\n";
+        echo "  --local-ip <ip>  Filter by local IP address (supports CIDR)\n";
+        echo "  --remote-ip <ip> Filter by remote IP address (supports CIDR)\n";
+        echo "  --ipv4         Show only IPv4 connections\n";
+        echo "  --ipv6         Show only IPv6 connections\n";
+        echo "  --watch [sec]    Refresh continuously (default: 2s)\n";
+        echo "  --stats          Show detailed statistics\n";
+        echo "  --output <file>  Write output to file\n";
+        echo "  --verbose, -v    Show performance metrics\n";
+        echo "  --help         Show this help message\n";
+    }
+}
+
+class Exporter {
+    public static function toFile(string $content, string $filename): void {
+        if (file_put_contents($filename, $content) === false) {
+            throw new RuntimeException("Failed to write to file: $filename");
+        }
+        echo "Output written to: $filename\n";
+    }
+}
+
+class Application {
+    public static function run(): void {
+        try {
+            PerformanceTracker::start();
+
+            if (php_sapi_name() !== 'cli') {
+                throw new RuntimeException("This script must be run from the command line.");
+            }
+
+            if (!stristr(PHP_OS, 'Linux')) {
+                throw new RuntimeException("This script is only supported on Linux systems.");
+            }
+
+            if (function_exists('posix_geteuid') && posix_geteuid() !== 0) {
+                fwrite(STDERR, "Note: Some information may be limited without root privileges.\n");
+            }
+
+            $options = OptionParser::parse($_SERVER['argv']);
+            
+            $monitor = new TCPConnectionMonitor($options);
+
+            if (isset($options['watch'])) {
+                $watcher = new ConnectionWatcher($monitor);
+                $interval = $options['watch_interval'] ?? 2;
+                $watcher->watch($options, $interval);
+                exit(0);
+            }
+
+            $connections = $monitor->getConnections();
+
+            if (empty($connections)) {
+                echo "No matching TCP connections found.\n";
+                self::displayPerformanceMetrics($options);
+                exit(0);
+            }
+
+            $output = '';
+            if (isset($options['count'])) {
+                $stats = OutputFormatter::getConnectionStats($connections);
+                echo "Counts: total=" . $stats['total'] . " IPv4={$stats['ipv4']} IPv6={$stats['ipv6']}\n";
+                OutputFormatter::displayStateSummary($stats);
+                exit(0);
+            }
+
+            if (isset($options['stats'])) {
+                $output = OutputFormatter::formatStatistics($connections);
+            } elseif (isset($options['j']) || isset($options['json'])) {
+                $output = OutputFormatter::formatJson($connections, $options['stats'] ?? false);
+            } elseif (isset($options['csv'])) {
+                $output = OutputFormatter::formatCsv($connections);
+            } else {
+                $output = OutputFormatter::formatTable($connections, $options['processes'] ?? false);
+            }
+
+            if (isset($options['output'])) {
+                Exporter::toFile($output, $options['output']);
             } else {
                 echo $output;
             }
+
+            self::displayPerformanceMetrics($options);
+
+        } catch (Exception $e) {
+            ErrorHandler::handle($e, $options['verbose'] ?? false);
+            exit(1);
         }
-        
-        if ($this->config['verbose']) {
-            echo PHP_EOL . self::BOLD . "Performance Metrics:" . self::RESET . PHP_EOL;
-            echo $this->getPerformanceMetrics();
+    }
+
+    private static function displayPerformanceMetrics(array $options): void {
+        if (isset($options['verbose']) || isset($options['v'])) {
+            $metrics = PerformanceTracker::getMetrics();
+            echo "\nPerformance Metrics:\n";
+            echo "Execution time: {$metrics['execution_time']}s\n";
+            echo "Memory peak: {$metrics['memory_peak_mb']} MB\n";
+            echo "Operations: {$metrics['operations']}\n";
         }
     }
 }
 
-// Run the application
-if (PHP_SAPI === 'cli') {
-    $monitor = new ConnectionMonitor();
-    $monitor->run($_SERVER['argv']);
-}
+register_shutdown_function(function() {
+    $error = error_get_last();
+    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+        fwrite(STDERR, "Fatal error: {$error['message']} in {$error['file']} on line {$error['line']}\n");
+    }
+});
+
+Application::run();
